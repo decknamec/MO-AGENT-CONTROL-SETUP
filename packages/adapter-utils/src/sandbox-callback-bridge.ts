@@ -137,6 +137,10 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   // Read-only schema discovery for validated control-plane requests.
   { method: "GET", path: /^\/api\/openapi\.json$/ },
 
+  // Task-Flow actions retain the controller's authenticated company/run checks;
+  // plugin administration and other plugin actions remain outside this bridge.
+  { method: "POST", path: /^\/api\/plugins\/relationflow\.task-flow\/actions\/(?:enroll|checkpoint)$/ },
+
   // Company-level reads used to discover work and context
   { method: "GET", path: /^\/api\/companies\/[^/]+$/ },
   { method: "GET", path: /^\/api\/companies\/[^/]+\/dashboard$/ },

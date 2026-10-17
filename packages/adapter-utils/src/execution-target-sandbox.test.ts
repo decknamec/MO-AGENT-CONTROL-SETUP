@@ -4008,6 +4008,75 @@ describe("sandbox adapter execution targets", () => {
     20000,
   );
 
+  it.each(["queue_v1", "http2_v1"] as const)("admits only task-flow actions with host-bound credentials over %s", async (mode) => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-task-flow-bridge-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    const sessionRef: { current: http2.ClientHttp2Session | null } = { current: null };
+    let bridgeToken = "";
+    const runner = mode === "http2_v1" ? makeHttp2SelectionRunner((ctx) => {
+      bridgeToken = ctx.bridgeToken;
+      ctx.emitReady();
+      sessionRef.current = ctx.connectHttp2();
+    }).runner : createLocalSandboxRunner();
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "task-flow-bound-run",
+      target: {
+        kind: "remote", transport: "sandbox", providerKey: "daytona", remoteCwd, runner,
+        timeoutMs: 30_000,
+        ...(mode === "http2_v1" ? { effectiveCapabilities: duplexCapabilities(true) } : {}),
+      },
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex", hostApiToken: "host-task-flow-jwt", hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: mode === "http2_v1",
+    });
+    try {
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe(mode);
+      if (mode === "http2_v1") await waitForCondition(() => sessionRef.current !== null, "task-flow HTTP/2 session", 4000);
+      else bridgeToken = bridge!.env.PAPERCLIP_API_KEY;
+      const body = Buffer.from(JSON.stringify({ companyId: "company-1", params: { issueId: "issue-1" } }));
+      const request = async (method: string, route: string, token = bridgeToken) => {
+        const headers = { authorization: `Bearer ${token}`, "content-type": "application/json",
+          "x-paperclip-run-id": "caller-spoofed-run", "x-not-allowed": "drop-me" };
+        if (sessionRef.current) return http2TestRequest(sessionRef.current, {
+          method, path: route, headers, ...(method === "GET" ? {} : { body }),
+        });
+        const response = await fetch(`${bridge!.env.PAPERCLIP_API_URL}${route}`, {
+          method, headers, ...(method === "GET" ? {} : { body }),
+        });
+        await response.arrayBuffer();
+        return { status: response.status };
+      };
+      const prefix = "/api/plugins/relationflow.task-flow/actions/";
+      expect((await request("POST", `${prefix}enroll`, "wrong-token")).status).toBe(401);
+      for (const route of [
+        `${prefix}other`, `${prefix}checkpoint/extra`, `${prefix}checkpoint/`,
+        `${prefix}%65nroll`, `${prefix}enroll%2Fcheckpoint`,
+        "/api/plugins/relationflowXtask-flow/actions/enroll",
+        "/api/plugins/other/actions/checkpoint", "/api/plugins/relationflow.task-flow/config",
+        "/api/plugins/relationflow.task-flow/enable",
+      ]) expect([400, 403]).toContain((await request("POST", route)).status);
+      for (const method of ["GET", "PATCH", "DELETE"])
+        expect((await request(method, `${prefix}checkpoint`)).status).toBe(403);
+      expect(api.requests).toHaveLength(0);
+      for (const action of ["enroll", "checkpoint"])
+        expect((await request("POST", `${prefix}${action}`)).status).toBe(200);
+      expect(api.requests).toHaveLength(2);
+      for (const [index, action] of ["enroll", "checkpoint"].entries()) {
+        expect(api.requests[index]).toMatchObject({ method: "POST", url: `${prefix}${action}`,
+          auth: "Bearer host-task-flow-jwt", runId: "task-flow-bound-run" });
+        expect(api.requests[index].body).toEqual(body);
+        expect(api.requests[index].headers["x-not-allowed"]).toBeUndefined();
+      }
+    } finally {
+      sessionRef.current?.close();
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20_000);
+
   it("test_route_allowlist_header_cleanup_and_token_replacement_hold_on_http2", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-http2-403-"));
     cleanupDirs.push(rootDir);

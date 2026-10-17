@@ -62,7 +62,7 @@ import { CAPABILITY_SEMANTIC_TOOL_CATALOG, runnerCodexDynamicToolsFit, SemanticT
 import { agentService } from "../agents.js";
 import { approvalService } from "../approvals.js";
 import { documentService } from "../documents.js";
-import { issueService } from "../issues.js";
+import { acquireIssueRelationGraphLock, issueService } from "../issues.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext, type NativeReviewAssignmentContext } from "./native-review-participant.js";
 import { childReviewOutcomes } from "./child-review-outcomes.js";
@@ -1702,6 +1702,9 @@ export class PaperclipRunnerToolAuthority {
   ): Promise<unknown> {
     return this.db.transaction(async (tx) => {
       try {
+        if (operationId === "create_task" || operationId === "set_dependencies") {
+          await acquireIssueRelationGraphLock(tx, this.binding.companyId);
+        }
         const context = await this.#lockAuthorizedMutationContext(
           tx as unknown as Db,
         );

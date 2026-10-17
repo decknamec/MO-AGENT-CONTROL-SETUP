@@ -1,10 +1,10 @@
-import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { hasWorkspaceRestoreFailure, resolveIssueRecoveryActionSchema } from "@paperclipai/shared";
 import { randomUUID } from "node:crypto";
 import { claimedAdapterType, conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
 import {
   chatActions,
   environmentLeases,
@@ -132,6 +132,129 @@ export async function validateExecutionReconciliation(input: {
   return run;
 }
 
+const LEGACY_RECONCILIATION_CAUSE = "legacy_execution_requires_reconciliation";
+const MAX_SAME_INCIDENT_ACTIONS = 100;
+type RecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
+
+// Callers hold the company-scoped issue lock before locking incident records.
+async function sameLegacyIncidentActions(db: Db, action: RecoveryActionRow) {
+  const runId = action.evidence.runId;
+  if (action.kind !== "active_run_watchdog" || action.cause !== LEGACY_RECONCILIATION_CAUSE ||
+      typeof runId !== "string" || action.fingerprint !== `legacy-execution:${runId}` || !action.returnOwnerAgentId) {
+    throw conflict("The recorded legacy recovery incident cannot be verified.");
+  }
+  const rows = await db.select().from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, action.companyId),
+    eq(issueRecoveryActions.sourceIssueId, action.sourceIssueId),
+    eq(issueRecoveryActions.kind, action.kind), eq(issueRecoveryActions.cause, action.cause),
+    eq(issueRecoveryActions.fingerprint, action.fingerprint),
+    eq(issueRecoveryActions.returnOwnerAgentId, action.returnOwnerAgentId),
+    sql`${issueRecoveryActions.evidence}->>'runId' = ${runId}`,
+  )).orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id))
+    .limit(MAX_SAME_INCIDENT_ACTIONS + 1).for("update");
+  if (rows.length > MAX_SAME_INCIDENT_ACTIONS) {
+    throw conflict("The historical recovery incident exceeds the bounded reconciliation scope.");
+  }
+  return rows;
+}
+
+function hasReconciliationDelivery(action: RecoveryActionRow) {
+  return ["executionReconciliation", "continuationDelivery", "continuationRunId", "continuationDeliveryOwner"]
+    .some(key => Object.hasOwn(action.evidence, key));
+}
+
+function rejectOtherIncidentDeliveries(rows: RecoveryActionRow[], canonicalId: string) {
+  const others = rows.filter(row => row.id !== canonicalId && hasReconciliationDelivery(row));
+  if (others.length) throw conflict("This incident already has another reconciliation delivery owner.", {
+    code: others.length === 1 ? "execution_reconciliation_already_recorded" : "execution_reconciliation_ambiguous",
+    ...(others.length === 1 ? { canonicalActionId: others[0]!.id } : {}),
+  });
+}
+
+/** Apply an existing Board decision to historical duplicates, without another delivery.
+ * The issue lock and the caller's transaction cover both the decision and this fold.
+ */
+export async function coalesceLegacyExecutionRecoveryHolds(input: {
+  db: Db;
+  companyId: string;
+  issueId: string;
+  actionId: string;
+  decision: ExecutionReconciliation;
+  actorId: string;
+}) {
+  const { db, companyId, issueId, actionId, decision, actorId } = input;
+  const [task] = await db.select().from(issues).where(and(
+    eq(issues.companyId, companyId), eq(issues.id, issueId),
+  )).for("update");
+  const [selected] = await db.select().from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
+    eq(issueRecoveryActions.id, actionId),
+  ));
+  if (!selected || !task || !task.assigneeAgentId || ["done", "cancelled"].includes(task.status) ||
+      selected.status !== "resolved" || selected.returnOwnerAgentId !== task.assigneeAgentId ||
+      selected.evidence.runId !== decision.runId) {
+    throw conflict("The canonical recovery decision no longer matches the task and owner.");
+  }
+  const rows = await sameLegacyIncidentActions(db, selected);
+  const canonical = rows.find(row => row.id === actionId)!;
+  const stored = canonical.evidence.executionReconciliation;
+  if (!stored || typeof stored !== "object" || Array.isArray(stored)) {
+    throw conflict("The canonical recovery decision has no verified operator receipt.");
+  }
+  const { actorId: originalActor, recordedAt, ...storedDecision } = stored as Record<string, unknown>;
+  const parsed = resolveIssueRecoveryActionSchema.safeParse({
+    outcome: "restored", sourceIssueStatus: "todo", executionReconciliation: storedDecision,
+  });
+  if (!parsed.success || !parsed.data.executionReconciliation ||
+      Object.entries(parsed.data.executionReconciliation).some(([key, value]) => storedDecision[key] !== value) ||
+      typeof originalActor !== "string" || !originalActor.trim() ||
+      typeof recordedAt !== "string" || !Number.isFinite(Date.parse(recordedAt)) ||
+      new Date(recordedAt).toISOString() !== recordedAt ||
+      !["pending", "delivered", "delegated"].includes(String(canonical.evidence.continuationDelivery)) ||
+      JSON.stringify(parsed.data.executionReconciliation) !== JSON.stringify({
+        runId: decision.runId, providerStopped: decision.providerStopped, actionOutcome: decision.actionOutcome,
+        outcomeEvidence: decision.outcomeEvidence,
+        ...(decision.workspaceRepairEvidence === undefined ? {} : { workspaceRepairEvidence: decision.workspaceRepairEvidence }),
+      })) {
+    throw conflict("Repeat the exact recorded reconciliation decision without changing its evidence or delivery.");
+  }
+  rejectOtherIncidentDeliveries(rows, canonical.id);
+  const [active] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
+    inArray(issueRecoveryActions.status, ["active", "escalated"]),
+  )).limit(1);
+  if (active) throw conflict("An active recovery action must be resolved independently.");
+  const run = await validateExecutionReconciliation({ db, companyId, issueId, agentId: task.assigneeAgentId,
+    sourceRunId: canonical.evidence.runId, decision: parsed.data.executionReconciliation });
+  if (run.runtimeMode !== "legacy" || run.agentId !== task.assigneeAgentId || run.errorCode === "native_session_cleanup_quarantined") {
+    throw conflict("This recovery incident requires its original execution owner and cleanup path.");
+  }
+  const siblings = rows.filter(row => {
+    const automatic = row.evidence.automaticRecovery as Record<string, unknown> | undefined;
+    return row.id !== canonical.id && row.status === "resolved" && row.outcome === "blocked" &&
+      row.createdAt.getTime() <= Date.parse(recordedAt) &&
+      !hasWorkspaceRestoreFailure(row.evidence) && row.evidence.originalFailureCode !== "native_session_cleanup_quarantined" &&
+      automatic?.policy === "preserve_without_replay_v1" && automatic.runId === decision.runId &&
+      automatic.replay === "blocked" && automatic.actionOutcome === "unknown";
+  });
+  if (siblings.some(sibling => Object.hasOwn(sibling.evidence, "executionReconciliationReference"))) {
+    throw conflict("A historical recovery hold already references another reconciliation.");
+  }
+  for (const sibling of siblings) {
+    await db.update(issueRecoveryActions).set({ evidence: { ...sibling.evidence,
+      automaticRecovery: { ...(sibling.evidence.automaticRecovery as object), replay: "reconciled" },
+      executionReconciliationReference: { actionId: canonical.id, runId: decision.runId, recordedAt },
+    } }).where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.id, sibling.id)));
+  }
+  if (siblings.length) await persistActivity(db, {
+    companyId, actorType: "user", actorId, action: "issue.execution_recovery_coalesced",
+    entityType: "issue", entityId: issueId,
+    details: { reason: "same_incident_holds_coalesced", canonicalActionId: canonical.id,
+      recoveryActionIds: siblings.map(row => row.id), runId: decision.runId },
+  });
+  return canonical;
+}
+
 /** Durable delivery marker lives on the existing source-scoped recovery action. */
 export async function markExecutionReconciliation(
   db: Db,
@@ -143,6 +266,13 @@ export async function markExecutionReconciliation(
   actorId: string,
   deliveryOwner?: { kind: "chat_failed_run_retry"; actionId: string },
 ) {
+  const [persistedAction] = await db.select().from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, action.companyId), eq(issueRecoveryActions.id, action.id),
+    eq(issueRecoveryActions.sourceIssueId, action.sourceIssueId),
+  ));
+  if (persistedAction?.cause === LEGACY_RECONCILIATION_CAUSE) {
+    rejectOtherIncidentDeliveries(await sameLegacyIncidentActions(db, persistedAction), persistedAction.id);
+  }
   if (deliveryOwner) {
     const [retry] = await db
       .select()
