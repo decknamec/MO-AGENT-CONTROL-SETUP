@@ -3160,6 +3160,104 @@ fn interrupted_tool_accepts_one_authoritative_result_across_restart_and_lost_ack
 }
 
 #[test]
+fn durable_backend_yields_turn_started_before_a_burst_and_preserves_ack_order() {
+    let directory = temporary_directory("durable-start-before-burst");
+    let config = provider_config(&directory, &["--split-event-burst"]);
+    let mut executor =
+        CodexCommandExecutor::with_runner_config(&directory, &durable_config(&directory));
+    executor
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config, "authorizedTools": task_context_tool_set()}),
+        ))
+        .unwrap();
+    executor
+        .execute(&command("open", 2, "session.open", json!({})))
+        .unwrap();
+    poll_and_ack(&mut executor).unwrap();
+    executor
+        .execute(&command(
+            "turn",
+            3,
+            "turn.start",
+            json!({"text": "Read the task context after streaming progress."}),
+        ))
+        .unwrap();
+
+    let first = executor.poll_events().expect("poll the start prefix");
+    assert_eq!(first.last().map(|event| event.event_type.as_str()), Some("turn.started"));
+    assert!(!first.iter().any(|event| {
+        matches!(event.event_type.as_str(), "item.delta" | "semantic_tool.input")
+    }));
+    assert_eq!(executor.retained_events().unwrap(), first);
+    assert_eq!(executor.poll_events().unwrap(), first, "ACK debt must replay the exact prefix");
+    executor.acknowledge_events(first.len()).unwrap();
+
+    let mut observed = first;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !observed.iter().any(|event| event.event_type == "semantic_tool.input") {
+        assert!(std::time::Instant::now() < deadline, "burst tool was not delivered");
+        observed.extend(poll_and_ack(&mut executor).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let prefix: Vec<_> = observed
+        .iter()
+        .filter(|event| event.event_type == "item.delta")
+        .map(|event| event.payload["text"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(prefix, (0..96).map(|index| format!("first-{index} ")).collect::<Vec<_>>());
+    let tools: Vec<_> = observed
+        .iter()
+        .filter(|event| event.event_type == "semantic_tool.input")
+        .collect();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].payload["semantic_tool"]["operationId"], "get_task_context");
+    assert_eq!(observed.last().unwrap().event_type, "semantic_tool.input");
+    assert!(executor.poll_events().unwrap().is_empty());
+
+    let delivered = executor
+        .execute(&command(
+            "tool-result",
+            4,
+            "semantic_tool.result",
+            json!({
+                "callId": "split-burst-semantic-call",
+                "operationId": "get_task_context",
+                "result": {"ok": true, "task": {"id": "task-1"}},
+                "isError": false,
+            }),
+        ))
+        .unwrap();
+    assert_eq!(delivered.result["status"], "delivered");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !observed.iter().any(|event| event.event_type == "turn.completed") {
+        assert!(std::time::Instant::now() < deadline, "burst terminal was not delivered");
+        observed.extend(poll_and_ack(&mut executor).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let deltas: Vec<_> = observed
+        .iter()
+        .filter(|event| event.event_type == "item.delta")
+        .map(|event| event.payload["text"].as_str().unwrap().to_owned())
+        .collect();
+    let expected: Vec<_> = (0..96)
+        .map(|index| format!("first-{index} "))
+        .chain((0..48).map(|index| format!("second-{index} ")))
+        .collect();
+    assert_eq!(deltas, expected);
+    for event_type in ["turn.started", "semantic_tool.input", "semantic_tool.result", "turn.completed"] {
+        assert_eq!(observed.iter().filter(|event| event.event_type == event_type).count(), 1, "{event_type}");
+    }
+    let unique_ids: std::collections::HashSet<_> = observed.iter().map(|event| &event.executor_event_id).collect();
+    assert_eq!(unique_ids.len(), observed.len());
+    assert!(executor.poll_events().unwrap().is_empty());
+    executor.shutdown().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn durable_backend_routes_a_semantic_tool_result_back_to_codex() {
     let directory = temporary_directory("durable-dynamic-tool");
     let config = provider_config(&directory, &["--require-dynamic-tool", "--emit-tool-call"]);
