@@ -2474,6 +2474,11 @@ mod tests {
                 .encrypt(&serde_json::to_vec(&welcome).unwrap(), true)
                 .unwrap();
             send_plain(&mut socket, &encrypted, server_config.max_frame_bytes).unwrap();
+            socket
+                .get_ref()
+                .set_read_timeout(Some(RUNTIME_READ_TIMEOUT))
+                .unwrap();
+            socket.get_ref().read_timeout().unwrap()
         });
 
         let endpoint = RunnerTransportEndpoint::new(&config.connect_url, &config.run_id).unwrap();
@@ -2488,13 +2493,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(
-            transport.socket.read_timeout().unwrap(),
-            Some(RUNTIME_READ_TIMEOUT)
-        );
+        // The kernel can round timeouts; both TCP sockets must report the same configured value.
+        assert_eq!(transport.socket.read_timeout().unwrap(), handle.join().unwrap());
         assert_eq!(welcome.connection.lease_id, "lease_1");
         assert_eq!(welcome.lease.unwrap().expose().unwrap(), "lease-secret");
-        handle.join().unwrap();
     }
 
     #[test]
