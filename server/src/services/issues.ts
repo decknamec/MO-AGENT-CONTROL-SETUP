@@ -6620,6 +6620,12 @@ export async function readIssueCommentRunLogText(run: {
   return content;
 }
 
+// Non-monotone graph writers take this transaction lock before any issue-row
+// lock. It serializes cycle checks and read/modify/write across different targets.
+export async function acquireIssueRelationGraphLock(tx: Pick<Db, "execute">, companyId: string) {
+  await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`issue-relations:${companyId}`}, 0))`);
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -7424,12 +7430,13 @@ export function issueService(db: Db) {
     }
   }
 
-  async function syncBlockedByIssueIds(
+  async function syncBlockedByIssueIdsInTransaction(
+    dbOrTx: DbTransaction,
     issueId: string,
     companyId: string,
     blockedByIssueIds: string[],
+    previousBlockerIssueIds: string[],
     actor: { agentId?: string | null; userId?: string | null } = {},
-    dbOrTx: any = db,
   ) {
     const deduped = [...new Set(blockedByIssueIds)];
     if (deduped.some((candidate) => candidate === issueId)) {
@@ -7458,28 +7465,26 @@ export function issueService(db: Db) {
       await assertNoBlockingCycles(companyId, issueId, deduped, dbOrTx);
     }
 
-    await dbOrTx
-      .delete(issueRelations)
-      .where(
-        and(
-          eq(issueRelations.companyId, companyId),
-          eq(issueRelations.relatedIssueId, issueId),
-          eq(issueRelations.type, "blocks"),
-        ),
-      );
-
-    if (deduped.length === 0) return;
-
-    await dbOrTx.insert(issueRelations).values(
-      deduped.map((blockerIssueId) => ({
-        companyId,
-        issueId: blockerIssueId,
-        relatedIssueId: issueId,
-        type: "blocks",
-        createdByAgentId: actor.agentId ?? null,
-        createdByUserId: actor.userId ?? null,
-      })),
-    );
+    // Use the mutation/receipt snapshot, not a fresh read after validation:
+    // liveness may delete a retained edge while blocker-row locking waits.
+    const before = new Set(previousBlockerIssueIds);
+    const after = new Set(deduped);
+    const removed = [...before].filter((id) => !after.has(id));
+    const added = deduped.filter((id) => !before.has(id));
+    // Keep retained rows (and their original author) intact. In particular, a
+    // concurrent monotone liveness DELETE must never be resurrected by a sync.
+    if (removed.length > 0) {
+      await dbOrTx.delete(issueRelations).where(and(
+        eq(issueRelations.companyId, companyId), eq(issueRelations.relatedIssueId, issueId),
+        eq(issueRelations.type, "blocks"), inArray(issueRelations.issueId, removed),
+      ));
+    }
+    if (added.length > 0) {
+      await dbOrTx.insert(issueRelations).values(added.map((blockerIssueId) => ({
+        companyId, issueId: blockerIssueId, relatedIssueId: issueId, type: "blocks" as const,
+        createdByAgentId: actor.agentId ?? null, createdByUserId: actor.userId ?? null,
+      })));
+    }
   }
 
   async function isTerminalOrMissingHeartbeatRun(
@@ -9394,27 +9399,9 @@ export function issueService(db: Db) {
       });
 
       if (blockParentUntilDone) {
-        const existingBlockers = await db
-          .select({ blockerIssueId: issueRelations.issueId })
-          .from(issueRelations)
-          .where(
-            and(
-              eq(issueRelations.companyId, parent.companyId),
-              eq(issueRelations.relatedIssueId, parent.id),
-              eq(issueRelations.type, "blocks"),
-            ),
-          );
-        await syncBlockedByIssueIds(
-          parent.id,
-          parent.companyId,
-          [
-            ...new Set([
-              ...existingBlockers.map((row) => row.blockerIssueId),
-              child.id,
-            ]),
-          ],
-          { agentId: actorAgentId ?? null, userId: actorUserId ?? null },
-        );
+        await issueService(db).mutateBlockedByIssueIds(parent.id, parent.companyId, [child.id], "add", {
+          actorAgentId: actorAgentId ?? null, actorUserId: actorUserId ?? null,
+        });
         [child] = await withIssueRelationSummaries(
           parent.companyId,
           [child],
@@ -9848,6 +9835,7 @@ export function issueService(db: Db) {
         throw unprocessable("in_progress issues require an assignee");
       }
       const persist = async (tx: DbTransaction) => {
+        if (blockedByIssueIds !== undefined) await acquireIssueRelationGraphLock(tx, companyId);
         await assertExecutionTaskParent(tx as unknown as Db, companyId, issueData.parentId);
         if (issueData.conversationAgentId && issueData.conversationUserId) {
           const identity = `conversation:${companyId}:${issueData.conversationAgentId}:${issueData.conversationUserId}`;
@@ -10261,15 +10249,16 @@ export function issueService(db: Db) {
           await syncIssueLabels(issue.id, companyId, inputLabelIds, tx);
         }
         if (blockedByIssueIds !== undefined) {
-          await syncBlockedByIssueIds(
+          await syncBlockedByIssueIdsInTransaction(
+            tx,
             issue.id,
             companyId,
             blockedByIssueIds,
+            [],
             {
               agentId: issueData.createdByAgentId ?? null,
               userId: issueData.createdByUserId ?? null,
             },
-            tx,
           );
         }
         if (initialPlan?.trim()) {
@@ -10635,6 +10624,44 @@ export function issueService(db: Db) {
       });
     },
 
+    // Import keeps historical issue timestamps/version intact while using the
+    // same graph serialization and edge validation as interactive mutations.
+    importBlockedByRelations: async (
+      companyId: string,
+      relations: Array<{ issueId: string; blockerIssueId: string }>,
+      actorUserId: string | null,
+    ) => db.transaction(async (tx) => {
+      await acquireIssueRelationGraphLock(tx, companyId);
+      const skipped: Array<{ issueId: string; blockerIssueId: string }> = [];
+      for (const relation of relations) {
+        const [target] = await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.id, relation.issueId), eq(issues.companyId, companyId),
+        )).for("update");
+        if (!target) throw unprocessable("Blocked-by issues must belong to the same company");
+        const current = await getIssueRelationSummaryMap(companyId, [target.id], tx);
+        try {
+          await syncBlockedByIssueIdsInTransaction(tx, target.id, companyId,
+            [...(current.get(target.id)?.blockedBy ?? []).map((entry) => entry.id), relation.blockerIssueId],
+            (current.get(target.id)?.blockedBy ?? []).map((entry) => entry.id),
+            { userId: actorUserId });
+        } catch (error) {
+          if (!(error instanceof HttpError) || error.status !== 422 || error.message !== "Blocking relations cannot contain cycles") throw error;
+          skipped.push(relation);
+        }
+      }
+      return skipped;
+    }),
+
+    mutateBlockedByIssueIds: async (
+      id: string,
+      companyId: string,
+      blockerIssueIds: string[],
+      mode: "add" | "remove",
+      actor: { actorAgentId?: string | null; actorUserId?: string | null; actorRunId?: string | null } = {},
+    ) => issueService(db).update(id, {
+      blockedByIssueIds: blockerIssueIds, companyGuard: companyId, ...actor,
+    }, db, undefined, undefined, { blockedByMutation: mode }),
+
     update: async (
       id: string,
       data: Partial<typeof issues.$inferInsert> & {
@@ -10649,7 +10676,12 @@ export function issueService(db: Db) {
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
       postCommitActions?: IssuePostCommitAction[],
-      options: { bindRuntimeSharedWorkspace?: boolean } = {},
+      options: {
+        bindRuntimeSharedWorkspace?: boolean;
+        // Internal service operations only; never part of the HTTP/SDK patch.
+        blockedByMutation?: "add" | "remove";
+        pruneResolvedBlockers?: boolean;
+      } = {},
     ) => {
       const ownedActivityPublications: ActivityPublication[] = [];
       const activityPublications =
@@ -10686,7 +10718,7 @@ export function issueService(db: Db) {
 
       const {
         labelIds: nextLabelIds,
-        blockedByIssueIds,
+        blockedByIssueIds: inputBlockedByIssueIds,
         actorAgentId,
         actorRunId,
         actorRunStopId,
@@ -10694,6 +10726,7 @@ export function issueService(db: Db) {
         companyGuard,
         ...issueData
       } = data;
+      let blockedByIssueIds = inputBlockedByIssueIds;
       // An explicit edit claims the title, even if it keeps the same text.
       if (issueData.title !== undefined) issueData.titleNeedsGeneration = false;
       if (
@@ -10955,6 +10988,7 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        if (inputBlockedByIssueIds !== undefined) await acquireIssueRelationGraphLock(tx, existing.companyId);
         // The receipt baseline must be read under the same row lock as the
         // write. Otherwise a concurrent update can be mistaken for a change
         // made by this request.
@@ -10985,6 +11019,21 @@ export function issueService(db: Db) {
             ? getIssueRelationSummaryMap(existing.companyId, [id], tx)
             : Promise.resolve(new Map<string, IssueRelationSummaryMap>()),
         ]);
+        if (inputBlockedByIssueIds !== undefined && options.blockedByMutation) {
+          let currentIds = (previousRelationSummaries.get(id)?.blockedBy ?? []).map((relation) => relation.id);
+          if (options.pruneResolvedBlockers && currentIds.length > 0) {
+            const terminal = await tx.select({ id: issues.id }).from(issues).where(and(
+              eq(issues.companyId, receiptExisting.companyId), inArray(issues.id, currentIds),
+              inArray(issues.status, ["done", "cancelled"]),
+            ));
+            const terminalIds = new Set(terminal.map((row: { id: string }) => row.id));
+            currentIds = currentIds.filter((id) => !terminalIds.has(id));
+          }
+          const requested = new Set(inputBlockedByIssueIds);
+          blockedByIssueIds = options.blockedByMutation === "add"
+            ? [...new Set([...currentIds, ...requested])]
+            : currentIds.filter((id) => !requested.has(id));
+        }
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, existing.companyId);
         const [currentProjectGoalId, nextProjectGoalId] = await Promise.all([
           getProjectDefaultGoalId(tx, existing.companyId, existing.projectId),
@@ -11176,15 +11225,16 @@ export function issueService(db: Db) {
           );
         }
         if (blockedByIssueIds !== undefined) {
-          await syncBlockedByIssueIds(
+          await syncBlockedByIssueIdsInTransaction(
+            tx,
             updated.id,
             existing.companyId,
             blockedByIssueIds,
+            (previousRelationSummaries.get(id)?.blockedBy ?? []).map((relation) => relation.id),
             {
               agentId: actorAgentId ?? null,
               userId: actorUserId ?? null,
             },
-            tx,
           );
         }
         if (
@@ -11225,10 +11275,10 @@ export function issueService(db: Db) {
           }
         }
         const [enriched] = await withIssueLabels(tx, [updated]);
-        const nextBlockedByIssueIds =
-          blockedByIssueIds === undefined
-            ? undefined
-            : [...new Set(blockedByIssueIds)].sort();
+        const relationSnapshot = blockedByIssueIds === undefined ? undefined
+          : (await getIssueRelationSummaryMap(receiptExisting.companyId, [id], tx)).get(id) ?? { blockedBy: [], blocks: [] };
+        const nextBlockedByIssueIds = relationSnapshot?.blockedBy.map((relation) => relation.id).sort();
+        const requestedBlockedByIssueIds = new Set(blockedByIssueIds);
         const changes = buildIssueChanges(
           receiptExisting as unknown as Record<string, unknown>,
           updated as unknown as Record<string, unknown>,
@@ -11268,6 +11318,9 @@ export function issueService(db: Db) {
             parsedIncident?.issueId &&
             parsedIncident.companyId === existing.companyId
           ) {
+            // Monotone exception to the graph lock: this only removes one
+            // edge. Diff-only syncs never reinsert retained edges, so concurrent
+            // add/set is serializable with this delete and cannot create a cycle.
             await tx
               .delete(issueRelations)
               .where(
@@ -11318,7 +11371,17 @@ export function issueService(db: Db) {
         return {
           ...enriched,
           ...(nextBlockedByIssueIds !== undefined
-            ? { blockedByIssueIds: nextBlockedByIssueIds }
+            ? {
+                blockedByIssueIds: nextBlockedByIssueIds,
+                relationMutation: {
+                  before: (previousRelationSummaries.get(id)?.blockedBy ?? []).map((relation) => relation.id).sort(),
+                  after: nextBlockedByIssueIds,
+                  added: [...requestedBlockedByIssueIds].filter((candidate) => !(previousRelationSummaries.get(id)?.blockedBy ?? []).some((relation) => relation.id === candidate)).sort(),
+                  removed: (previousRelationSummaries.get(id)?.blockedBy ?? []).map((relation) => relation.id).filter((candidate) => !requestedBlockedByIssueIds.has(candidate)).sort(),
+                  beforeRelations: previousRelationSummaries.get(id) ?? { blockedBy: [], blocks: [] },
+                  relations: relationSnapshot!,
+                },
+              }
             : {}),
           changes,
         };

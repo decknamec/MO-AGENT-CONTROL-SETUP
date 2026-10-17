@@ -6346,23 +6346,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         if (attachmentRows.length > 0) await issues.addImportedAttachments(attachmentRows);
 
         if (blockedByBySlug.size > 0) {
-          const acceptedAdjacency = new Map<string, string[]>();
-          const wouldCreateBlockingCycle = (blockedIssueId: string, blockerIssueId: string) => {
-            // Mirrors assertNoBlockingCycles in the issues service: a cycle
-            // exists when the blocked issue already (transitively) blocks the
-            // prospective blocker.
-            const queue = [...(acceptedAdjacency.get(blockedIssueId) ?? [])];
-            const visited = new Set<string>([blockedIssueId]);
-            while (queue.length > 0) {
-              const current = queue.shift()!;
-              if (current === blockerIssueId) return true;
-              if (visited.has(current)) continue;
-              visited.add(current);
-              queue.push(...(acceptedAdjacency.get(current) ?? []));
-            }
-            return false;
-          };
-          const relationRows: Array<{ issueId: string; relatedIssueId: string }> = [];
+          const relations: Array<{ issueId: string; blockerIssueId: string; slug: string; blockerSlug: string }> = [];
           for (const [slug, blockerSlugs] of blockedByBySlug) {
             const blockedIssueId = importedIssueIdBySlug.get(slug);
             if (!blockedIssueId) continue;
@@ -6372,30 +6356,15 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
                 warnings.push(`Task ${slug} blocker ${blockerSlug} was skipped because that task was not imported.`);
                 continue;
               }
-              if (blockerIssueId === blockedIssueId) continue;
-              if (wouldCreateBlockingCycle(blockedIssueId, blockerIssueId)) {
-                warnings.push(`Task ${slug} blocker ${blockerSlug} was skipped because it would create a blocking cycle.`);
-                continue;
+              if (blockerIssueId !== blockedIssueId) {
+                relations.push({ issueId: blockedIssueId, blockerIssueId, slug, blockerSlug });
               }
-              const adjacency = acceptedAdjacency.get(blockerIssueId) ?? [];
-              adjacency.push(blockedIssueId);
-              acceptedAdjacency.set(blockerIssueId, adjacency);
-              relationRows.push({ issueId: blockerIssueId, relatedIssueId: blockedIssueId });
             }
           }
-          if (relationRows.length > 0) {
-            const relationCompanyId = targetCompany.id;
-            await db
-              .insert(issueRelations)
-              .values(relationRows.map((row) => ({
-                companyId: relationCompanyId,
-                issueId: row.issueId,
-                relatedIssueId: row.relatedIssueId,
-                type: "blocks" as const,
-                createdByAgentId: null,
-                createdByUserId: actorUserId ?? null,
-              })))
-              .onConflictDoNothing();
+          const skipped = await issues.importBlockedByRelations(targetCompany.id, relations, actorUserId ?? null);
+          for (const relation of skipped) {
+            const source = relations.find((entry) => entry.issueId === relation.issueId && entry.blockerIssueId === relation.blockerIssueId)!;
+            warnings.push(`Task ${source.slug} blocker ${source.blockerSlug} was skipped because it would create a blocking cycle.`);
           }
         }
 

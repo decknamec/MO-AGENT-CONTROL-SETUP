@@ -52,6 +52,7 @@ const issueSvc = {
   listAttachments: vi.fn(),
   createAttachment: vi.fn(),
   importIssues: vi.fn(),
+  importBlockedByRelations: vi.fn(),
   archiveImportedInbox: vi.fn(),
   addImportedComments: vi.fn(),
   addImportedAttachments: vi.fn(),
@@ -329,6 +330,7 @@ describe("company portability", () => {
       color: data.color,
     }));
     issueSvc.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
+    issueSvc.importBlockedByRelations.mockResolvedValue([]);
     issueSvc.listAttachments.mockResolvedValue([]);
     issueSvc.createAttachment.mockResolvedValue({ id: "attachment-imported" });
     documentSvc.listIssueDocuments.mockResolvedValue([]);
@@ -4302,16 +4304,12 @@ describe("company portability", () => {
         }),
       ]),
     );
-    expect(insertedRelationValues).toEqual([
-      {
-        companyId: "company-imported",
-        issueId: alphaId,
-        relatedIssueId: betaId,
-        type: "blocks",
-        createdByAgentId: null,
-        createdByUserId: "user-1",
-      },
-    ]);
+    expect(insertedRelationValues).toEqual([]);
+    expect(issueSvc.importBlockedByRelations).toHaveBeenCalledWith(
+      "company-imported",
+      [expect.objectContaining({ issueId: betaId, blockerIssueId: alphaId })],
+      "user-1",
+    );
     // Monitor notes/provenance ride on the issue row itself now, so there is no
     // separate post-insert update. The monitor still lands un-armed.
     expect(monitorUpdates).toEqual([]);

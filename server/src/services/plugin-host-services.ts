@@ -1132,14 +1132,17 @@ export function buildHostServices(
     actorUserId?: string | null;
     actorRunId?: string | null;
   }) => {
-    const existing = requireInCompany("Issue", await issues.getById(params.issueId), params.companyId);
-    const previous = await issues.getRelationSummaries(params.issueId);
-    await issues.update(params.issueId, {
-      blockedByIssueIds: params.blockedByIssueIds,
-      actorAgentId: params.actorAgentId ?? null,
-      actorUserId: params.actorUserId ?? null,
-    } as any);
-    const relations = await issues.getRelationSummaries(params.issueId);
+    const updated = requireInCompany("Issue", params.mutation === "set"
+      ? await issues.update(params.issueId, {
+          blockedByIssueIds: params.blockedByIssueIds, companyGuard: params.companyId,
+          actorAgentId: params.actorAgentId ?? null, actorUserId: params.actorUserId ?? null,
+          actorRunId: params.actorRunId ?? null,
+        })
+      : await issues.mutateBlockedByIssueIds(params.issueId, params.companyId, params.blockedByIssueIds, params.mutation, {
+          actorAgentId: params.actorAgentId ?? null, actorUserId: params.actorUserId ?? null,
+          actorRunId: params.actorRunId ?? null,
+        }), params.companyId);
+    const receipt = updated.relationMutation!;
     await logPluginActivity({
       companyId: params.companyId,
       action: "issue.relations.updated",
@@ -1151,13 +1154,15 @@ export function buildHostServices(
         actorRunId: params.actorRunId,
       },
       details: {
-        identifier: existing.identifier,
+        identifier: updated.identifier,
         mutation: params.mutation,
-        blockedByIssueIds: params.blockedByIssueIds,
-        previousBlockedByIssueIds: previous.blockedBy.map((relation) => relation.id),
+        blockedByIssueIds: receipt.after,
+        previousBlockedByIssueIds: receipt.before,
+        addedBlockerIssueIds: receipt.added,
+        removedBlockerIssueIds: receipt.removed,
       },
     });
-    return relations;
+    return receipt.relations;
   };
 
   const getIssueCostSummary = async (
@@ -2007,18 +2012,10 @@ export function buildHostServices(
       async addBlockers(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
-        requireInCompany("Issue", await issues.getById(params.issueId), companyId);
-        const previous = await issues.getRelationSummaries(params.issueId);
-        const nextBlockedByIssueIds = [
-          ...new Set([
-            ...previous.blockedBy.map((relation) => relation.id),
-            ...params.blockerIssueIds,
-          ]),
-        ];
         return setBlockedByWithActivity({
           companyId,
           issueId: params.issueId,
-          blockedByIssueIds: nextBlockedByIssueIds,
+          blockedByIssueIds: params.blockerIssueIds,
           mutation: "add",
           actorAgentId: params.actorAgentId,
           actorUserId: params.actorUserId,
@@ -2028,16 +2025,10 @@ export function buildHostServices(
       async removeBlockers(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
-        requireInCompany("Issue", await issues.getById(params.issueId), companyId);
-        const previous = await issues.getRelationSummaries(params.issueId);
-        const removals = new Set(params.blockerIssueIds);
-        const nextBlockedByIssueIds = previous.blockedBy
-          .map((relation) => relation.id)
-          .filter((issueId) => !removals.has(issueId));
         return setBlockedByWithActivity({
           companyId,
           issueId: params.issueId,
-          blockedByIssueIds: nextBlockedByIssueIds,
+          blockedByIssueIds: params.blockerIssueIds,
           mutation: "remove",
           actorAgentId: params.actorAgentId,
           actorUserId: params.actorUserId,

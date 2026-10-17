@@ -9,6 +9,7 @@ import { authorizationService, type AuthorizationActor } from "./authorization.j
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { signDecisionSpec, verifyDecisionSpec } from "./decision-signing.js";
 import {
+  acquireIssueRelationGraphLock,
   issueService,
   type IssuePostCommitAction,
 } from "./issues.js";
@@ -411,6 +412,9 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
       const executionResult = await db.transaction(async (tx) => {
+        if (effect.type === "resolve_blocker" || effect.type === "create_issue") {
+          await acquireIssueRelationGraphLock(tx, decision.companyId);
+        }
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
         let execution = await tx.select().from(decisionEffectExecutions).where(and(eq(decisionEffectExecutions.decisionId, decision.id), eq(decisionEffectExecutions.effectIndex, effectIndex)))
           .then((rows) => rows[0] ?? null);
@@ -495,24 +499,25 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
           if (effect.comment) await svc.addComment(target.id, interpolate(effect.comment, values), { userId: decidedByUserId }, undefined, tx);
           result = { issueId: updated?.id };
         } else if (effect.type === "resolve_blocker") {
-          const current = await tx.select({ id: issueRelations.issueId }).from(issueRelations).where(and(eq(issueRelations.companyId, decision.companyId), eq(issueRelations.relatedIssueId, target.id), eq(issueRelations.type, "blocks")));
-          await svc.update(
+          const updated = await svc.update(
             target.id,
             {
-              blockedByIssueIds: current.map((row) => row.id).filter((id) => !effect.removeBlockedByIssueIds.includes(id)),
+              blockedByIssueIds: effect.removeBlockedByIssueIds,
+              companyGuard: decision.companyId,
               actorUserId: decidedByUserId,
             },
             tx,
             postCommitActivityPublications,
             postCommitIssueActions,
+            { blockedByMutation: "remove" },
           );
-          result = { removedBlockedByIssueIds: effect.removeBlockedByIssueIds };
+          result = { removedBlockedByIssueIds: updated?.relationMutation?.removed ?? [] };
         } else if (effect.type === "create_issue") {
           const draft = effect.draft;
           const created = await svc.create(decision.companyId, { title: draft.title, description: draft.description ?? null, parentId: draft.parentId ?? target.id,
             assigneeAgentId: draft.assigneeAgentId ?? null, assigneeUserId: draft.assigneeUserId ?? null, projectId: draft.projectId ?? target.projectId,
             goalId: draft.goalId ?? null, blockedByIssueIds: draft.blockedByIssueIds ?? [], createdByUserId: decidedByUserId, actorRunId: decision.originRunId,
-            idempotencyKey: `decision-effect:${decision.id}:${effectIndex}` });
+            idempotencyKey: `decision-effect:${decision.id}:${effectIndex}` }, tx);
           result = { issueId: created.id };
         } else {
           const cancelled = [target.id, ...cancellationDescendantIds!].reverse();

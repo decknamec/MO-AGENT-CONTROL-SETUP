@@ -283,10 +283,19 @@ describe("issue activity event routes", () => {
     mockIssueService.getRelationSummaries.mockImplementation(async () => relationSummaries());
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => {
       const from = blockedByIssueIds;
+      const beforeRelations = relationSummaries();
       blockedByIssueIds = [...new Set(patch.blockedByIssueIds as string[])].sort();
       return {
         ...issueUpdateWithReceipt(issue, patch),
         blockedByIssueIds,
+        relationMutation: {
+          before: from,
+          after: blockedByIssueIds,
+          added: blockedByIssueIds.filter((id) => !from.includes(id)),
+          removed: from.filter((id) => !blockedByIssueIds.includes(id)),
+          beforeRelations,
+          relations: relationSummaries(),
+        },
         changes: buildIssueChanges(issue, issue, {
           blockedByIssueIds: { from, to: blockedByIssueIds },
         }),
@@ -397,7 +406,7 @@ describe("issue activity event routes", () => {
     `);
   });
 
-  it("logs blocker activity with added and removed issue summaries", async () => {
+  it("logs blocker activity from the locked mutation receipt despite a concurrent summary change", async () => {
     const issue = makeIssue();
     mockIssueService.getById.mockResolvedValue(issue);
     const previousRelations = {
@@ -428,15 +437,21 @@ describe("issue activity event routes", () => {
       ],
       blocks: [],
     };
-    let relationLookupCount = 0;
-    mockIssueService.getRelationSummaries.mockImplementation(async () => {
-      relationLookupCount += 1;
-      return relationLookupCount === 1 ? previousRelations : nextRelations;
-    });
+    // A later read observes another writer; it must not replace this request's
+    // authoritative before/after/ownership receipt in the audit record.
+    mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...issue,
       ...patch,
       updatedAt: new Date(),
+      relationMutation: {
+        before: previousRelations.blockedBy.map((entry) => entry.id),
+        after: nextRelations.blockedBy.map((entry) => entry.id),
+        added: nextRelations.blockedBy.map((entry) => entry.id),
+        removed: previousRelations.blockedBy.map((entry) => entry.id),
+        beforeRelations: previousRelations,
+        relations: nextRelations,
+      },
     }));
 
     const res = await request(await createApp())
@@ -444,6 +459,10 @@ describe("issue activity event routes", () => {
       .send({ blockedByIssueIds: ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"] });
 
     expect(res.status).toBe(200);
+    expect(res.body.blockedByIssueIds).toEqual(nextRelations.blockedBy.map((entry) => entry.id));
+    expect(res.body.blockedBy).toEqual(nextRelations.blockedBy);
+    expect(res.body.relationMutation).toBeUndefined();
+    expect(mockIssueService.getRelationSummaries).not.toHaveBeenCalled();
     await vi.waitFor(() => {
       expect(mockLogActivity).toHaveBeenCalledWith(
         expect.anything(),

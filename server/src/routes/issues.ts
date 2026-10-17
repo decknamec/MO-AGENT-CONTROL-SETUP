@@ -280,6 +280,7 @@ import { decisionTrainingService } from "../services/decision-training.js";
 import { feedbackService } from "../services/feedback.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import {
+  acquireIssueRelationGraphLock,
   ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS,
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
@@ -12877,9 +12878,6 @@ export function issueRoutes(
         );
       const titleOrDescriptionChanged =
         req.body.title !== undefined || req.body.description !== undefined;
-      const existingRelations = Array.isArray(req.body.blockedByIssueIds)
-        ? await svc.getRelationSummaries(existing.id)
-        : null;
       const {
         comment: commentBody,
         commentClientRequestId,
@@ -13738,6 +13736,9 @@ export function issueRoutes(
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
+            if (issueUpdateData.blockedByIssueIds !== undefined) {
+              await acquireIssueRelationGraphLock(tx, existing.companyId);
+            }
             if (
               reviewPolicySensitiveMutationRequested &&
               !(await assertLockedReviewPolicyAllowsMutation(tx))
@@ -13930,6 +13931,7 @@ export function issueRoutes(
               updateReferenceSummaryAfter,
             )
           : null;
+      const { relationMutation: _relationMutation, ...publicIssue } = issue;
       let issueResponse: typeof issue & {
         blockedBy?: unknown;
         blocks?: unknown;
@@ -13938,19 +13940,13 @@ export function issueRoutes(
           ReturnType<typeof issueReferencesSvc.listIssueReferenceSummary>
         >;
         referencedIssueIdentifiers?: string[];
-      } = issue;
-      let updatedRelations: Awaited<
-        ReturnType<typeof svc.getRelationSummaries>
-      > | null = null;
-      if (issue && Array.isArray(req.body.blockedByIssueIds)) {
-        updatedRelations = await svc.getRelationSummaries(issue.id);
+      } = publicIssue;
+      if (issue.relationMutation) {
         issueResponse = {
-          ...issue,
-          blockedByIssueIds:
-            issue.blockedByIssueIds ??
-            [...new Set(req.body.blockedByIssueIds as string[])].sort(),
-          blockedBy: updatedRelations.blockedBy,
-          blocks: updatedRelations.blocks,
+          ...publicIssue,
+          blockedByIssueIds: issue.relationMutation.after,
+          blockedBy: issue.relationMutation.relations.blockedBy,
+          blocks: issue.relationMutation.relations.blocks,
         };
       }
       await routinesSvc.syncRunStatusForIssue(issue.id);
@@ -14131,21 +14127,12 @@ export function issueRoutes(
           });
       }
 
-      if (Array.isArray(req.body.blockedByIssueIds)) {
-        const previousBlockedByIds = new Set(
-          (existingRelations?.blockedBy ?? []).map((relation) => relation.id),
-        );
-        const nextBlockedByIds = new Set(
-          req.body.blockedByIssueIds as string[],
-        );
-        const addedBlockedByIssueIds = [...nextBlockedByIds].filter(
-          (candidate) => !previousBlockedByIds.has(candidate),
-        );
-        const removedBlockedByIssueIds = [...previousBlockedByIds].filter(
-          (candidate) => !nextBlockedByIds.has(candidate),
-        );
-        const nextBlockedByRelations = updatedRelations?.blockedBy ?? [];
-        const previousBlockedByRelations = existingRelations?.blockedBy ?? [];
+      if (issue.relationMutation) {
+        const receipt = issue.relationMutation;
+        const addedBlockedByIssueIds = receipt.added;
+        const removedBlockedByIssueIds = receipt.removed;
+        const nextBlockedByRelations = receipt.relations.blockedBy;
+        const previousBlockedByRelations = receipt.beforeRelations.blockedBy;
         if (
           addedBlockedByIssueIds.length > 0 ||
           removedBlockedByIssueIds.length > 0
@@ -14162,7 +14149,7 @@ export function issueRoutes(
             entityId: issue.id,
             details: {
               identifier: issue.identifier,
-              blockedByIssueIds: req.body.blockedByIssueIds,
+              blockedByIssueIds: receipt.after,
               addedBlockedByIssueIds,
               removedBlockedByIssueIds,
               blockedByIssues: nextBlockedByRelations.map(
