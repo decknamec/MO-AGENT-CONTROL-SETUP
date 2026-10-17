@@ -1,3 +1,4 @@
+import { coalesceLegacyExecutionRecoveryHolds } from "../services/execution-recovery-resolution.js";
 import { setIssueTitle } from "../services/issue-title.js";
 import { setIssueTitleSchema } from "@paperclipai/shared";
 import { resolveConfirmationFromComment } from "../services/confirmation-comment-resolution.js";
@@ -9190,6 +9191,17 @@ export function issueRoutes(
               issueRecoveryActionReadModel(settled),
               { source: "recovery_action_resolution" },
             );
+            if (settled.cause === "legacy_execution_requires_reconciliation" &&
+                settled.evidence.executionReconciliation && executionReconciliation &&
+                outcome === "restored" && sourceIssueStatus === "todo") {
+              assertBoard(req);
+              if (activeRecoveryAction) throw conflict("An active recovery action must be resolved independently.");
+              const canonical = await coalesceLegacyExecutionRecoveryHolds({
+                db: tx as unknown as Db, companyId: lockedIssue.companyId, issueId: lockedIssue.id,
+                actionId: settled.id, decision: executionReconciliation, actorId: actor.actorId,
+              });
+              return { issue: lockedIssue, recoveryAction: canonical, replayed: true };
+            }
             const automatic = settled.evidence.automaticRecovery as
               { replay?: string } | undefined;
             if (automatic?.replay === "blocked" && executionReconciliation) {
@@ -9537,6 +9549,12 @@ export function issueRoutes(
           tx,
         );
         if (!recoveryAction) throw notFound("Active recovery action not found");
+        if (executionReconciliation && recoveryAction.cause === "legacy_execution_requires_reconciliation") {
+          await coalesceLegacyExecutionRecoveryHolds({
+            db: tx as unknown as Db, companyId: lockedIssue.companyId, issueId: lockedIssue.id,
+            actionId: recoveryAction.id, decision: executionReconciliation, actorId: actor.actorId,
+          });
+        }
 
         return { issue, recoveryAction, chatRetry };
       });
