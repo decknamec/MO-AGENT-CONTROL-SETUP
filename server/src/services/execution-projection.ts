@@ -6,7 +6,7 @@ import {
   nativeRunFinalizations,
   type Db,
 } from "@paperclipai/db";
-import type { ExecutionProjection } from "@paperclipai/shared";
+import { hasWorkspaceRestoreFailure, resolveIssueRecoveryActionSchema, type ExecutionProjection } from "@paperclipai/shared";
 import { EXECUTION_CONTROL_DEADLINE_MS } from "./execution-control-deadline.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
@@ -101,7 +101,13 @@ export async function executionProjectionsForRuns(
   const recovery = issueIds.length
     ? await read(async () => db
         .select({
+          id: issueRecoveryActions.id,
           issueId: issueRecoveryActions.sourceIssueId,
+          kind: issueRecoveryActions.kind,
+          fingerprint: issueRecoveryActions.fingerprint,
+          returnOwnerAgentId: issueRecoveryActions.returnOwnerAgentId,
+          createdAt: issueRecoveryActions.createdAt,
+          outcome: issueRecoveryActions.outcome,
           cause: issueRecoveryActions.cause,
           nextAction: issueRecoveryActions.nextAction,
           evidence: issueRecoveryActions.evidence,
@@ -121,12 +127,44 @@ export async function executionProjectionsForRuns(
         )
         .orderBy(desc(issueRecoveryActions.updatedAt)))
     : [];
+  const recoveryById = new Map(recovery.map(row => [row.id, row]));
+  // A reference alone cannot hide a hold. Resolve it against the actual Board
+  // decision for this exact incident; unrelated/newer holds keep their priority.
+  const hasCanonicalReconciliation = (row: typeof recovery[number]) => {
+    const reference = row.evidence.executionReconciliationReference as Record<string, unknown> | undefined;
+    const automatic = row.evidence.automaticRecovery as Record<string, unknown> | undefined;
+    const canonical = typeof reference?.actionId === "string" ? recoveryById.get(reference.actionId) : undefined;
+    if (!canonical || canonical.id === row.id || row.status !== "resolved" || row.outcome !== "blocked" ||
+        canonical.status !== "resolved" || canonical.outcome !== "handed_back" || canonical.issueId !== row.issueId ||
+        canonical.kind !== "active_run_watchdog" || row.kind !== canonical.kind ||
+        canonical.cause !== "legacy_execution_requires_reconciliation" || row.cause !== canonical.cause ||
+        !canonical.returnOwnerAgentId || row.returnOwnerAgentId !== canonical.returnOwnerAgentId ||
+        canonical.fingerprint !== `legacy-execution:${reference?.runId}` || row.fingerprint !== canonical.fingerprint ||
+        canonical.evidence.runId !== reference?.runId || row.evidence.runId !== reference?.runId ||
+        automatic?.policy !== "preserve_without_replay_v1" || automatic.runId !== reference?.runId ||
+        automatic.replay !== "reconciled" || automatic.actionOutcome !== "unknown" ||
+        hasWorkspaceRestoreFailure(row.evidence) || row.evidence.originalFailureCode === "native_session_cleanup_quarantined" ||
+        !["pending", "delivered", "delegated"].includes(String(canonical.evidence.continuationDelivery))) return false;
+    const receipt = canonical.evidence.executionReconciliation;
+    if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) return false;
+    const { actorId, recordedAt, ...decision } = receipt as Record<string, unknown>;
+    const parsed = resolveIssueRecoveryActionSchema.safeParse({
+      outcome: "restored", sourceIssueStatus: "todo", executionReconciliation: decision,
+    });
+    return parsed.success && !!parsed.data.executionReconciliation &&
+      parsed.data.executionReconciliation.runId === reference?.runId &&
+      Object.entries(parsed.data.executionReconciliation).every(([key, value]) => decision[key] === value) &&
+      typeof actorId === "string" && actorId.trim().length > 0 && typeof recordedAt === "string" &&
+      Number.isFinite(Date.parse(recordedAt)) && new Date(recordedAt).toISOString() === recordedAt &&
+      reference?.recordedAt === recordedAt && row.createdAt.getTime() <= Date.parse(recordedAt);
+  };
   const coordinatorByRun = new Map(coordinators.map((row) => [row.runId, row]));
   for (const run of runs) {
     const issueId = run.nativeIssueId ?? text(run.contextSnapshot?.issueId);
     const matching = recovery.filter(
       (row) =>
         row.issueId === issueId &&
+        !hasCanonicalReconciliation(row) &&
         (row.status !== "resolved" || row.evidence.executionReconciliation || row.evidence.automaticRecovery) &&
         (row.evidence.runId === run.id || row.evidence.sourceRunId === run.id),
     );

@@ -1,7 +1,7 @@
 import * as cloudIdentity from "../cloud-runtime-identity.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -21,6 +21,7 @@ import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embed
 import { initializeRunIdentity, reserveSteeredIdentity, reconcileSteeredIdentity } from "../run-identity.js";
 import { documentService } from "../documents.js";
 import { issueService } from "../issues.js";
+import { buildHostServices } from "../plugin-host-services.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 import { createAssignedMcpTools } from "./assigned-mcp-tools.js";
 import type { ToolGatewayService } from "../tool-gateway.js";
@@ -93,6 +94,42 @@ describe("PaperclipRunnerToolAuthority", () => {
 
   afterAll(async () => {
     await temporary?.cleanup();
+  });
+
+  it("takes the graph lock before native ownership locks during concurrent dependency writes", async () => {
+    const company = randomUUID(), agent = randomUUID(), task = randomUUID(), blocker = randomUUID(), run = randomUUID();
+    await db.insert(companies).values({ id: company, name: "Concurrent tools", issuePrefix: company.slice(0, 6) });
+    await db.insert(agents).values({ id: agent, companyId: company, name: "Native writer", adapterType: "paperclip_runner", status: "active" });
+    await db.insert(issues).values([
+      { id: task, companyId: company, title: "Native target", status: "in_progress", assigneeAgentId: agent },
+      { id: blocker, companyId: company, title: "Blocker", status: "todo" },
+    ]);
+    await db.insert(heartbeatRuns).values({ id: run, companyId: company, agentId: agent, status: "running", runtimeMode: "native", nativeIssueId: task });
+    await db.update(issues).set({ executionRunId: run }).where(eq(issues.id, task));
+    const names = ["relations-native", "relations-plugin"];
+    const [nativeDb, pluginDb] = names.map((applicationName) => createDb(temporary!.connectionString, { applicationName }));
+    const authority = new PaperclipRunnerToolAuthority(nativeDb, { companyId: company, agentId: agent, issueId: task, runId: run, workMode: "standard" });
+    const plugin = buildHostServices(pluginDb, "native-relation-test", "paperclip.relations-test", {
+      forPlugin: () => ({ emit: async () => {}, subscribe: () => {} }),
+    } as any);
+    let operations: Promise<unknown>[] = [];
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select id from issues where id = ${task} for update`);
+      const nativeWrite = authority.execute({ tool: "set_dependencies", callId: "concurrent-relations",
+        arguments: { idempotencyKey: "concurrent-relations", blockedByTaskIds: [blocker] } });
+      await expect.poll(async () => (await db.execute(sql`select pid from pg_stat_activity where application_name = ${names[0]} and wait_event_type = 'Lock'`)).length,
+        { timeout: 5_000 }).toBeGreaterThan(0);
+      operations = [nativeWrite, plugin.issues.addBlockers({ companyId: company, issueId: blocker, blockerIssueIds: [task] })];
+      void Promise.allSettled(operations);
+      await expect.poll(async () => (await db.execute(sql`select pid from pg_stat_activity where application_name = ${names[1]} and wait_event_type = 'Lock'`)).length,
+        { timeout: 5_000 }).toBeGreaterThan(0);
+    });
+    const results = await Promise.allSettled(operations);
+    expect(results[0].status).toBe("fulfilled");
+    expect(results[1].status).toBe("rejected");
+    expect((results[1] as PromiseRejectedResult).reason.message).toBe("Blocking relations cannot contain cycles");
+    expect((await issueService(db).getRelationSummaries(task)).blockedBy.map((entry) => entry.id)).toEqual([blocker]);
+    expect((await issueService(db).getRelationSummaries(blocker)).blockedBy).toEqual([]);
   });
 
   it("advertises only real bindings and reads the bound task", async () => {

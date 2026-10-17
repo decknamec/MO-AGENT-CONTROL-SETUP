@@ -2858,15 +2858,6 @@ export function recoveryService(
       );
   }
 
-  async function existingUnresolvedBlockerIssueIds(
-    companyId: string,
-    issueId: string,
-  ) {
-    return existingUnresolvedBlockerIssues(companyId, issueId).then((rows) =>
-      rows.map((row) => row.id),
-    );
-  }
-
   async function openChildIssues(issue: typeof issues.$inferSelect) {
     return db
       .select({ id: issues.id, identifier: issues.identifier })
@@ -3467,19 +3458,10 @@ export function recoveryService(
         hasNewSourcePath
       ) {
         if (healthyChildren.length > 0 && !sourceState.hasDurableWaitingPath) {
-          const blockerIds = await existingUnresolvedBlockerIssueIds(
-            issue.companyId,
-            issue.id,
-          );
           await issuesSvc.update(issue.id, {
-            status: "blocked",
-            blockedByIssueIds: [
-              ...new Set([
-                ...blockerIds,
-                ...healthyChildren.map((child) => child.id),
-              ]),
-            ],
-          });
+            status: "blocked", companyGuard: issue.companyId,
+            blockedByIssueIds: healthyChildren.map((child) => child.id),
+          }, db, undefined, undefined, { blockedByMutation: "add", pruneResolvedBlockers: true });
         }
         const resolved = await recoveryActionsSvc.resolveActiveForIssue({
           companyId: action.companyId,
@@ -3949,14 +3931,9 @@ export function recoveryService(
         agentId: recoveryAction.returnOwnerAgentId,
       });
     }
-    const blockerIds = await existingUnresolvedBlockerIssueIds(
-      input.issue.companyId,
-      input.issue.id,
-    );
     const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
-      blockedByIssueIds: blockerIds,
-    });
+      status: "blocked", companyGuard: input.issue.companyId, blockedByIssueIds: [],
+    }, db, undefined, undefined, { blockedByMutation: "add", pruneResolvedBlockers: true });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
     const sourceAssigneePreserved =
@@ -4141,7 +4118,7 @@ export function recoveryService(
           userId: updated.assigneeUserId,
         },
         sourceAssigneePreserved,
-        blockerIssueIds: blockerIds,
+        blockerIssueIds: updated.blockedByIssueIds ?? [],
       },
     });
 
