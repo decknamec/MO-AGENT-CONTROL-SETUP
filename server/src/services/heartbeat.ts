@@ -22892,9 +22892,24 @@ export function heartbeatService(
           return { dispatched: false };
         const repairBlock = await recovery.legacyRepairDispatchBlock(run.id);
         if (repairBlock) {
+          const now = new Date();
+          const reason = `Disposition repair suppressed: ${repairBlock}`;
           const cancelled = await setRunStatusIfRunning(run.id, "cancelled", {
-            finishedAt: new Date(), errorCode: "legacy_disposition_repair_suppressed",
-            error: `Disposition repair suppressed: ${repairBlock}`,
+            finishedAt: now,
+            errorCode: "legacy_disposition_repair_suppressed",
+            error: reason,
+            resultJson: {
+              cancellation: {
+                source: "control_plane",
+                expected: true,
+                initiator: { type: "system" },
+                reason,
+                recordedAt: now.toISOString(),
+              },
+              // This gate runs before the provider handoff. A rejected repair
+              // has no provider work to reconcile or replay.
+              executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+            },
           });
           if (cancelled.updated) {
             await setWakeupStatus(run.wakeupRequestId, "skipped", { finishedAt: new Date(), error: repairBlock });
