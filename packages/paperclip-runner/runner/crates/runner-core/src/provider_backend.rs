@@ -4338,6 +4338,11 @@ impl CodexCommandExecutor {
                             },
                         );
                     }
+                    // Let the controller observe the durable start before a queued
+                    // output burst delays its startup acknowledgement.
+                    if method == "turn/started" && !receipt_limit_terminal_poll {
+                        break;
+                    }
                 }
                 CodexProviderEvent::RuntimeRequest {
                     request_id,

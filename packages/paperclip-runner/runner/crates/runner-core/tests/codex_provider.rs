@@ -3247,10 +3247,22 @@ fn durable_backend_yields_turn_started_before_a_burst_and_preserves_ack_order() 
         .chain((0..48).map(|index| format!("second-{index} ")))
         .collect();
     assert_eq!(deltas, expected);
-    for event_type in ["turn.started", "semantic_tool.input", "semantic_tool.result", "turn.completed"] {
-        assert_eq!(observed.iter().filter(|event| event.event_type == event_type).count(), 1, "{event_type}");
+    for event_type in [
+        "turn.started",
+        "semantic_tool.input",
+        "semantic_tool.result",
+        "turn.completed",
+    ] {
+        assert_eq!(
+            observed.iter().filter(|event| event.event_type == event_type).count(),
+            1,
+            "{event_type}",
+        );
     }
-    let unique_ids: std::collections::HashSet<_> = observed.iter().map(|event| &event.executor_event_id).collect();
+    let unique_ids: std::collections::HashSet<_> = observed
+        .iter()
+        .map(|event| &event.executor_event_id)
+        .collect();
     assert_eq!(unique_ids.len(), observed.len());
     assert!(executor.poll_events().unwrap().is_empty());
     executor.shutdown().unwrap();
