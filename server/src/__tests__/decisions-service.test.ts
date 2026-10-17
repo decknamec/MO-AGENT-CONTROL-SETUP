@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -23,6 +23,7 @@ import {
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { attentionService } from "../services/attention.js";
 import { decisionService } from "../services/decisions.js";
+import { buildHostServices } from "../services/plugin-host-services.js";
 import { hashAttentionArchiveManifest } from "../services/decision-retention.js";
 import type { AttentionArchiveManifestEntry, AttentionArchiveTargetSnapshot } from "@paperclipai/shared";
 
@@ -235,10 +236,11 @@ describePg("decisionService", () => {
     const created = await service().create({
       companyId, actor: agentActor(), agentId, runId, title: "Resolve blocker?", body: "Body",
       options: [{ id: "yes", label: "Yes", effects: [{ type: "resolve_blocker", targetIssueId, staleness: "lenient",
-        removeBlockedByIssueIds: [removedBlockerId] }] }],
+        removeBlockedByIssueIds: [removedBlockerId, downstreamId] }] }],
     });
 
-    await service().decide({ id: created.id, optionId: "yes", decidedByUserId, userActor: boardActor() });
+    const result = await service().decide({ id: created.id, optionId: "yes", decidedByUserId, userActor: boardActor() });
+    expect(result.executions[0].result).toEqual({ removedBlockedByIssueIds: [removedBlockerId] });
 
     const relations = await db.select().from(issueRelations).where(eq(issueRelations.companyId, companyId));
     expect(relations).toEqual(expect.arrayContaining([
@@ -248,6 +250,40 @@ describePg("decisionService", () => {
     expect(relations).not.toEqual(expect.arrayContaining([
       expect.objectContaining({ issueId: removedBlockerId, relatedIssueId: targetIssueId, type: "blocks" }),
     ]));
+  });
+
+  it("serializes a decision blocker removal with a concurrent plugin addition", async () => {
+    const oldBlocker = randomUUID();
+    const newBlocker = randomUUID();
+    await db.insert(issues).values([oldBlocker, newBlocker].map((id) => ({ id, companyId, title: "Blocker", status: "todo" })));
+    await db.insert(issueRelations).values({ companyId, issueId: oldBlocker, relatedIssueId: targetIssueId, type: "blocks" });
+    const created = await service().create({
+      companyId, actor: agentActor(), agentId, runId, title: "Resolve?", body: "Body",
+      options: [{ id: "yes", label: "Yes", effects: [{ type: "resolve_blocker", targetIssueId, staleness: "lenient", removeBlockedByIssueIds: [oldBlocker] }] }],
+    });
+    const writerNames = ["relations-decision", "relations-plugin"];
+    const [decisionDb, pluginDb] = writerNames.map((applicationName) => createDb(tempDb!.connectionString, { applicationName }));
+    const plugin = buildHostServices(pluginDb, "relations-decision-test", "paperclip.relations-test", {
+      forPlugin: () => ({ emit: async () => {}, subscribe: () => {} }),
+    } as any);
+    let operations: Promise<unknown>[] = [];
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select id from issues where id = ${targetIssueId} for update`);
+      operations = [
+        decisionService(decisionDb, { wakeOriginAgent: async () => {} }).decide({ id: created.id, optionId: "yes", decidedByUserId, userActor: boardActor() }),
+        plugin.issues.addBlockers({ companyId, issueId: targetIssueId, blockerIssueIds: [newBlocker] }),
+      ];
+      void Promise.allSettled(operations);
+      await expect.poll(async () => {
+        const rows = await db.execute(sql`select application_name from pg_stat_activity
+          where application_name in (${writerNames[0]}, ${writerNames[1]}) and wait_event_type = 'Lock'`);
+        return new Set(rows.map((row) => row.application_name)).size;
+      }, { timeout: 5_000 }).toBe(2);
+    });
+    const [decisionResult] = await Promise.all(operations) as [{ executionStatus: string }, unknown];
+    expect(decisionResult.executionStatus).toBe("succeeded");
+    const rows = await db.select().from(issueRelations).where(eq(issueRelations.relatedIssueId, targetIssueId));
+    expect(rows.map((row) => row.issueId)).toEqual([newBlocker]);
   });
 
   it("rejects mutation proposals from an origin actor with read-only access", async () => {
