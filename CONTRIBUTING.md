@@ -1,5 +1,16 @@
 # Contributing Guide
 
+## Contributions to this fork
+
+PRs targeting `decknamec/MO-AGENT-CONTROL-SETUP` use a short, free-form description of the change and its verification.
+Report material risks and checks that could not run.
+No PR template, model declaration, checklist, or Greptile score is required for this fork.
+Code and dependency checks remain applicable to the changes they cover.
+
+## Contributions to upstream Paperclip
+
+The guidance below applies to PRs targeting `paperclipai/paperclip`.
+
 Thanks for wanting to contribute!
 
 We really appreciate both small fixes and thoughtful larger changes.
@@ -25,7 +36,7 @@ Affirm that you did this search by checking the dedup-search box in the PR templ
 - Make sure the change is very targeted and easy to review
 - All tests pass and CI is green
 - Greptile score is 5/5 with all comments addressed
-- Use the [PR template](.github/PULL_REQUEST_TEMPLATE.md)
+- Use the [PR template](https://github.com/paperclipai/paperclip/blob/master/.github/PULL_REQUEST_TEMPLATE.md)
 
 These almost always get merged quickly when they're clean.
 
@@ -40,7 +51,7 @@ These almost always get merged quickly when they're clean.
   - Proof it works (manual testing notes)
   - All tests passing and CI green
   - Greptile score 5/5 with all comments addressed
-  - [PR template](.github/PULL_REQUEST_TEMPLATE.md) fully filled out
+  - [PR template](https://github.com/paperclipai/paperclip/blob/master/.github/PULL_REQUEST_TEMPLATE.md) fully filled out
 
 PRs that follow this path are **much** more likely to be accepted, even when they're large.
 
@@ -51,7 +62,7 @@ PRs that follow this path are **much** more likely to be accepted, even when the
 
 ### Use the PR Template
 
-Every pull request **must** follow the PR template at [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md). If you create a PR via the GitHub API or other tooling that bypasses the template, copy its contents into your PR description manually. The template includes required sections: Thinking Path, What Changed, Verification, Risks, Model Used, and a Checklist.
+Every pull request **must** follow the PR template at [`.github/PULL_REQUEST_TEMPLATE.md`](https://github.com/paperclipai/paperclip/blob/master/.github/PULL_REQUEST_TEMPLATE.md). If you create a PR via the GitHub API or other tooling that bypasses the template, copy its contents into your PR description manually. The template includes required sections: Thinking Path, What Changed, Verification, Risks, Model Used, and a Checklist.
 
 ### Link Issues or Describe Them In-PR
 
@@ -172,7 +183,7 @@ Bugs, docs improvements, and small targeted improvements are still the easiest p
 
 Write all PR text in Simplified Technical English (ASD-STE100): use short sentences, one instruction per sentence, simple approved vocabulary, and the active voice.
 
-Your PR description must follow the [PR template](.github/PULL_REQUEST_TEMPLATE.md). All sections are required. The "thinking path" at the top explains from the top of the project down to what you fixed. E.g.:
+Your PR description must follow the [PR template](https://github.com/paperclipai/paperclip/blob/master/.github/PULL_REQUEST_TEMPLATE.md). All sections are required. The "thinking path" at the top explains from the top of the project down to what you fixed. E.g.:
 
 ### Thinking Path Example 1:
 

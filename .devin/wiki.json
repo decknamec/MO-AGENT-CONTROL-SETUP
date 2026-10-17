@@ -85,7 +85,7 @@
           "content": "Build a 'What are you changing?' table for a company-scoped API feature, UI behavior, orchestration policy, database change, adapter, connector, plugin, and Runner protocol. Map each to its owning layer, relevant local contributor skill, and validation entry point. Walk a small company-scoped feature across schema/shared validator/service/authorized route/UI client/page/test boundaries without inventing a new feature API. Explain the domain/application/adapter boundary, activity logging, error handling, and contract synchronization. Link setup, UI, data, testing, release, and extension details to their pages; avoid duplicating their instructions."
         },
         {
-          "content": "Source anchors: `AGENTS.md`, `CONTRIBUTING.md`, `.github/PULL_REQUEST_TEMPLATE.md`, `.agents/skills/`, `server/src/modules/README.md`, `packages/shared/src/validators/`, `server/src/routes/authz.ts`, `ui/src/api/client.ts`. Use `server/src/__tests__/authz-company-access.test.ts` and `scripts/check-module-boundaries.test.mjs` as examples of invariant checks, not proof that an unrelated new feature works."
+          "content": "Source anchors: `AGENTS.md`, `CONTRIBUTING.md`, `.agents/skills/`, `server/src/modules/README.md`, `packages/shared/src/validators/`, `server/src/routes/authz.ts`, `ui/src/api/client.ts`. Use `server/src/__tests__/authz-company-access.test.ts` and `scripts/check-module-boundaries.test.mjs` as examples of invariant checks, not proof that an unrelated new feature works."
         }
       ]
     },

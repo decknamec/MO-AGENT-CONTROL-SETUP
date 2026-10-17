@@ -385,14 +385,14 @@ test('passes with plain feature labels and real content under each', () => {
   assert.equal(checkLinkedIssue(FILLED_PLAIN_FEATURE_LABELS, 'feat: inline feature').passed, true);
 });
 
-// The real .github/PULL_REQUEST_TEMPLATE.md, submitted unchanged, must fail the
+// The upstream PR template fixture, submitted unchanged, must fail the
 // gate. Its skeleton labels have no content and its example issue links live in
 // HTML comments, so neither the inline path nor the linked path may pass it.
 const PR_TEMPLATE_PATH = fileURLToPath(
-  new URL('../../PULL_REQUEST_TEMPLATE.md', import.meta.url)
+  new URL('./fixtures/upstream-pr-template.md', import.meta.url)
 );
 
-test('fails with the unfilled default PR template body', () => {
+test('fails with the unfilled upstream PR template body', () => {
   const body = readFileSync(PR_TEMPLATE_PATH, 'utf8');
   const result = checkLinkedIssue(body, 'feat: unfilled template');
   assert.equal(result.passed, false);
