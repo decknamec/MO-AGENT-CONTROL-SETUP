@@ -7,10 +7,10 @@ alwaysApply: true
 
 This rule applies when reviewing pull requests throughout this repository.
 
-- Follow the PR description guide in `CONTRIBUTING.md` and the sections in
-  `.github/PULL_REQUEST_TEMPLATE.md`. Request missing thinking paths and missing
-  explanations of what changed, why it matters, the benefits, verification, or
-  risks.
+- For PRs targeting `decknamec/MO-AGENT-CONTROL-SETUP`, accept a short, free-form
+  description. Request missing context, verification results, or material limitations.
+  Do not require template headings, model declarations, checklist confirmations, or Greptile scores.
+  For PRs targeting `paperclipai/paperclip`, follow its upstream contribution rules.
 - For verification claims, read and apply
   [Preserve failures through acceptance](../.agents/skills/verify-paperclip/SKILL.md#preserve-failures-through-acceptance).
   Check that material failures remain accounted for after a successful retry.
